@@ -63,7 +63,7 @@ class SupersetPreviewClient(BaseSupersetPreviewClient):
 
                 table_name = params.get('tableName')
 
-                request_data['sql'] = 'SELECT * FROM {schema}.{table} LIMIT 50'.format(schema=schema, table=table_name)
+                request_data['sql'] = 'SELECT * FROM {schema}.{table}'.format(schema=schema, table=table_name)
 
             except Exception as e:
                 logging.error('Encountered error generating request sql: ' + str(e))
