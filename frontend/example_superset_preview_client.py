@@ -11,7 +11,7 @@ from amundsen_application.base.base_superset_preview_client import BaseSupersetP
 # 'main' is an existing default Superset database which serves for demo purposes
 DEFAULT_DATABASE_MAP = {
     'main': 1,
-    'postgres':2
+    'mssql':2
 }
 
 LOGIN_URL = 'http://10.0.2.15:8088/login/'
