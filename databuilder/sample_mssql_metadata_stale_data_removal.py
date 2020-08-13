@@ -1,6 +1,10 @@
+# Copyright Contributors to the Amundsen project.
+# SPDX-License-Identifier: Apache-2.0
+
 """
 This is a example script which demo how to load data
-into Neo4j and Elasticsearch without using an Airflow DAG.
+into Neo4j and Elasticsearch from MS SQL Server
+without using an Airflow DAG.
 
 """
 
@@ -11,7 +15,7 @@ from elasticsearch import Elasticsearch
 from pyhocon import ConfigFactory
 from sqlalchemy.ext.declarative import declarative_base
 
-from databuilder.extractor.postgres_metadata_extractor import PostgresMetadataExtractor
+from databuilder.extractor.mssql_metadata_extractor import MSSQLMetadataExtractor
 from databuilder.extractor.sql_alchemy_extractor import SQLAlchemyExtractor
 from databuilder.extractor.neo4j_extractor import Neo4jExtractor
 from databuilder.extractor.neo4j_search_data_extractor import Neo4jSearchDataExtractor
@@ -23,6 +27,7 @@ from databuilder.publisher.elasticsearch_publisher import ElasticsearchPublisher
 from databuilder.publisher.neo4j_csv_publisher import Neo4jCsvPublisher
 from databuilder.task.task import DefaultTask
 from databuilder.transformer.base_transformer import NoopTransformer
+from databuilder.task.neo4j_staleness_removal_task import Neo4jStalenessRemovalTask
 
 es_host = None
 neo_host = None
@@ -36,7 +41,6 @@ es = Elasticsearch([
 ])
 
 DB_FILE = '/tmp/test.db'
-SQLITE_CONN_STRING = 'sqlite:////tmp/test.db'
 Base = declarative_base()
 
 NEO4J_ENDPOINT = 'bolt://{}:7687'.format(neo_host if neo_host else 'localhost')
@@ -48,31 +52,66 @@ neo4j_password = 'test'
 
 
 # todo: connection string needs to change
-def connection_string():
-    user = 'postgres'
-    password = 'root'
-    host = 'localhost'
-    port = '5432'
-    db = 'test'
-    return "postgresql://%s:%s@%s:%s/%s" % (user, password, host, port, db)
+def connection_string(windows_auth=False):
+    """Generages an MSSQL connection string.
 
 
-def run_postgres_job():
+    Keyword Arguments:
+        windows_auth {bool} -- set to true if connecting to DB using windows
+                                credentials. (default: {False})
+
+    Returns:
+        [str] -- [connection string]
+    """
+
+    if windows_auth:
+        base_string = (
+            "mssql+pyodbc://@{host}/{db}" +
+            "?driver=ODBC+Driver+17+for+SQL+Server" +
+            "?trusted_connection=yes" +
+            "&autocommit=true"  # comment to disable autocommit.
+        )
+        params = {
+
+            "host": "localhost",
+            "db": "master"
+        }
+
+    else:
+        base_string = (
+            "mssql+pyodbc://{user}:{pword}@{host}/{db}" +
+            "?driver=ODBC+Driver+17+for+SQL+Server" +
+            "&autocommit=true"  # comment to disable autocommit.
+        )
+        params = {
+            "user": "SA",
+            "pword": "Root@123",
+            "host": "localhost",
+            "db": "PersonDB"
+        }
+
+    return base_string.format(**params)
+
+
+def run_mssql_job():
     where_clause_suffix = textwrap.dedent("""
-        where table_schema = 'public'
+        ('dbo')
     """)
 
     tmp_folder = '/var/tmp/amundsen/table_metadata'
     node_files_folder = '{tmp_folder}/nodes/'.format(tmp_folder=tmp_folder)
-    relationship_files_folder = '{tmp_folder}/relationships/'.format(tmp_folder=tmp_folder)
+    relationship_files_folder = '{tmp_folder}/relationships/'.format(
+        tmp_folder=tmp_folder)
 
     job_config = ConfigFactory.from_dict({
-        'extractor.postgres_metadata.{}'.format(PostgresMetadataExtractor.WHERE_CLAUSE_SUFFIX_KEY):
-            where_clause_suffix,
-        'extractor.postgres_metadata.{}'.format(PostgresMetadataExtractor.USE_CATALOG_AS_CLUSTER_NAME):
-            True,
-        'extractor.postgres_metadata.extractor.sqlalchemy.{}'.format(SQLAlchemyExtractor.CONN_STRING):
-            connection_string(),
+        # MSSQL Loader
+        'extractor.mssql_metadata.{}'.format(
+            MSSQLMetadataExtractor.WHERE_CLAUSE_SUFFIX_KEY): where_clause_suffix,
+        'extractor.mssql_metadata.{}'.format(
+            MSSQLMetadataExtractor.USE_CATALOG_AS_CLUSTER_NAME): True,
+        'extractor.mssql_metadata.extractor.sqlalchemy.{}'.format(
+            SQLAlchemyExtractor.CONN_STRING): connection_string(),
+        # NEO4J Loader
         'loader.filesystem_csv_neo4j.{}'.format(FsNeo4jCSVLoader.NODE_DIR_PATH):
             node_files_folder,
         'loader.filesystem_csv_neo4j.{}'.format(FsNeo4jCSVLoader.RELATION_DIR_PATH):
@@ -90,9 +129,13 @@ def run_postgres_job():
         'publisher.neo4j.{}'.format(neo4j_csv_publisher.JOB_PUBLISH_TAG):
             'unique_tag',  # should use unique tag here like {ds}
     })
-    job = DefaultJob(conf=job_config,
-                     task=DefaultTask(extractor=PostgresMetadataExtractor(), loader=FsNeo4jCSVLoader()),
-                     publisher=Neo4jCsvPublisher())
+
+    job = DefaultJob(
+        conf=job_config,
+        task=DefaultTask(
+            extractor=MSSQLMetadataExtractor(),
+            loader=FsNeo4jCSVLoader()),
+        publisher=Neo4jCsvPublisher())
     return job
 
 
@@ -158,12 +201,35 @@ def create_es_publisher_sample_job(elasticsearch_index_alias='table_search_index
                      publisher=ElasticsearchPublisher())
     return job
 
+# Modified portion
+def remove_stale_data():
+    task = Neo4jStalenessRemovalTask()
+
+    job_config_dict = {
+        'job.identifier': 'remove_stale_data_job',
+        'task.remove_stale_data.neo4j_endpoint': neo4j_endpoint,
+        'task.remove_stale_data.neo4j_user': neo4j_user,
+        'task.remove_stale_data.neo4j_password': neo4j_password,
+        'task.remove_stale_data.staleness_max_pct': 110,
+        'task.remove_stale_data.target_nodes': ['Table', 'Column'],
+        'task.remove_stale_data.job_publish_tag': 'idk'
+    }
+
+    job_config = ConfigFactory.from_dict(job_config_dict)
+    job = DefaultJob(conf=job_config, task=task)
+    
+    return job
+
 
 if __name__ == "__main__":
     # Uncomment next line to get INFO level logging
     # logging.basicConfig(level=logging.INFO)
+    
+    #Modified portion
+    removal_job = remove_stale_data()
+    removal_job.launch()
 
-    loading_job = run_postgres_job()
+    loading_job = run_mssql_job()
     loading_job.launch()
 
     job_es_table = create_es_publisher_sample_job(
